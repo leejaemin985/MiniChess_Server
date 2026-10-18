@@ -33,6 +33,7 @@ public sealed class Lobby
 
         if (ProtocolJson.DecodeClient(first) is not JoinMatchMessage join || join.ProtocolVersion != ProtocolInfo.Version)
         {
+            _logger.LogWarning("[{Connection}] rejected: first message must be JoinMatch v{Version}", connection.Id, ProtocolInfo.Version);
             await connection.SendAsync(new ErrorMessage { Message = $"첫 메시지는 JoinMatch(ProtocolVersion={ProtocolInfo.Version})여야 합니다" });
             await connection.CloseAsync("bad join");
             return;
@@ -47,6 +48,9 @@ public sealed class Lobby
         {
             ClientMessage? message = ProtocolJson.DecodeClient(text);
             MatchRoom? current = session.Room;
+
+            if (message == null)
+                _logger.LogWarning("[{Connection}] could not decode message", connection.Id);
 
             if (message is CommandMessage command && current != null)
                 await current.HandleAsync(connection, command);

@@ -1,7 +1,6 @@
 using MiniChess.Core.Common;
 using MiniChess.Core.Controller;
 using MiniChess.Core.Events;
-using MiniChess.Core.Presets;
 using MiniChess.Protocol;
 using MiniChess.Server.Connections;
 using MiniChess.Server.Protocol;
@@ -25,6 +24,7 @@ public sealed class MatchRoom
     }
 
     private readonly GameController _game;
+    private readonly int _seed;
     private readonly Seat[] _seats;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly ILogger _logger;
@@ -40,19 +40,11 @@ public sealed class MatchRoom
             new Seat { Connection = player2, Team = Team.Player2 },
         };
 
-        // [임시] 경기 규칙/맵/캐릭터는 지금 클라이언트와 같은 프로토타입 프리셋을 쓴다.
-        int seed = Random.Shared.Next();
-        _game = GameController.Create(new GameConfig
-        {
-            Rules = PrototypeTestPreset.CreateRules(),
-            Map = PrototypeTestPreset.CreateTestMap(),
-            Characters = PrototypeTestPreset.CreateCharacters(),
-            Skills = PrototypeTestPreset.CreateSkills(),
-            Seed = seed,
-        });
+        _seed = Random.Shared.Next();
+        _game = OnlineMatch.Create(_seed);
 
         // 시드와 명령 순서만 있으면 경기를 그대로 재현할 수 있다.
-        _logger.LogInformation("Match {Match} created: seed={Seed}, P1={P1}, P2={P2}", Id, seed, player1.Id, player2.Id);
+        _logger.LogInformation("Match {Match} created: seed={Seed}, P1={P1}, P2={P2}", Id, _seed, player1.Id, player2.Id);
     }
 
     public async Task StartAsync()
@@ -61,7 +53,7 @@ public sealed class MatchRoom
         try
         {
             foreach (Seat seat in _seats)
-                await seat.Connection.SendAsync(new MatchStartedMessage { YourTeam = seat.Team, Snapshot = _game.GetSnapshot(seat.Team) });
+                await seat.Connection.SendAsync(new MatchStartedMessage { YourTeam = seat.Team, Seed = _seed, Snapshot = _game.GetSnapshot(seat.Team) });
         }
         finally
         {
@@ -80,7 +72,7 @@ public sealed class MatchRoom
             seat.LastRequestId = command.RequestId;
 
             CommandOutcome outcome = _game.State.IsGameOver
-                ? CommandOutcome.Fail("GameOver")
+                ? CommandOutcome.Fail(CommandOutcome.GameOver)
                 : CommandExecutor.Execute(_game, seat.Team, command);
 
             _logger.LogInformation("Match {Match} {Team} {Command}#{Request}: {Result}",
@@ -88,7 +80,10 @@ public sealed class MatchRoom
 
             await from.SendAsync(new CommandResultMessage { RequestId = command.RequestId, Success = outcome.Success, Reason = outcome.Reason });
             if (outcome.Success)
+            {
+                await BroadcastAppliedAsync(seat.Team, command);
                 await BroadcastAsync(outcome.Events);
+            }
         }
         finally
         {
@@ -117,6 +112,21 @@ public sealed class MatchRoom
         }
 
         await CloseIfOverAsync();
+    }
+
+    /// <summary>[임시: 클라 로컬 복제 방식] 실행한 명령을 양쪽에 알린다. 클라이언트는 같은 명령을 자기 경기에 실행한다.</summary>
+    private async Task BroadcastAppliedAsync(Team team, CommandMessage command)
+    {
+        var applied = new CommandAppliedMessage
+        {
+            Team = team,
+            CommandType = MessageTypes.NameOf(command.GetType()),
+            Command = command,
+            LastEventSequence = _game.State.Events.Count - 1,
+        };
+
+        foreach (Seat seat in _seats)
+            await seat.Connection.SendAsync(applied);
     }
 
     private async Task BroadcastAsync(IReadOnlyList<GameEvent> events)

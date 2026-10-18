@@ -65,6 +65,19 @@ public class MatchFlowTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.Equal(3, stale.GetProperty("RequestId").GetInt32());
         Assert.Equal(CommandOutcome.StaleTurn, stale.GetProperty("Reason").GetString());
 
+        // [로컬 복제 방식] 시드 + 실행된 명령(배치 2, 턴 종료 1)을 그대로 실행하면 서버와 같은 이벤트 순번이 된다.
+        var mirror = OnlineMatch.Create(aStart.GetProperty("Seed").GetInt32());
+        for (int i = 0; i < 3; i++)
+        {
+            JsonElement applied = await a.NextAsync("CommandApplied");
+            Type type = MessageTypes.Find(applied.GetProperty("CommandType").GetString())!;
+            var command = (CommandMessage)applied.GetProperty("Command").Deserialize(type, ProtocolJson.Options)!;
+            Team team = Enum.Parse<Team>(applied.GetProperty("Team").GetString()!);
+
+            Assert.True(CommandExecutor.Execute(mirror, team, command).Success);
+            Assert.Equal(applied.GetProperty("LastEventSequence").GetInt32(), mirror.State.Events.Count - 1);
+        }
+
         // 기다리던 쪽이 끊기면 턴을 가진 쪽 승리로 끝난다.
         await waiting.DisposeAsync();
         JsonElement ended = await active.NextEventAsync("GameEndedEvent");

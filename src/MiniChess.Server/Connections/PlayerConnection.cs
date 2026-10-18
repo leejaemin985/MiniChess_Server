@@ -13,14 +13,20 @@ public sealed class PlayerConnection
 {
     private const int MaxMessageBytes = 64 * 1024;
 
+    /// <summary>로그에 남길 메시지 본문의 최대 길이. 넘으면 잘라서 남긴다(이벤트 묶음 등).</summary>
+    private const int MaxLoggedChars = 400;
+
     private readonly WebSocket _socket;
+    private readonly ILogger _logger;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
     public string Id { get; } = Guid.NewGuid().ToString("N")[..8];
 
-    public PlayerConnection(WebSocket socket)
+    public PlayerConnection(WebSocket socket, ILogger<PlayerConnection> logger)
     {
         _socket = socket;
+        _logger = logger;
+        _logger.LogInformation("[{Connection}] connected", Id);
     }
 
     /// <summary>다음 텍스트 메시지. 연결이 끊겼거나 닫혔으면 null.</summary>
@@ -35,25 +41,38 @@ public sealed class PlayerConnection
             {
                 WebSocketReceiveResult result = await _socket.ReceiveAsync(buffer, cancellationToken);
                 if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    _logger.LogInformation("[{Connection}] closed by client", Id);
                     return null;
+                }
 
                 message.Write(buffer, 0, result.Count);
                 if (message.Length > MaxMessageBytes)
                     return null;
 
-                if (result.EndOfMessage)
-                    return result.MessageType == WebSocketMessageType.Text ? Encoding.UTF8.GetString(message.ToArray()) : null;
+                if (!result.EndOfMessage)
+                    continue;
+
+                if (result.MessageType != WebSocketMessageType.Text)
+                    return null;
+
+                string text = Encoding.UTF8.GetString(message.ToArray());
+                _logger.LogInformation("[{Connection}] <= {Message}", Id, Shorten(text));
+                return text;
             }
         }
         catch (Exception exception) when (exception is WebSocketException or OperationCanceledException)
         {
+            _logger.LogInformation("[{Connection}] connection lost: {Reason}", Id, exception.Message);
             return null;
         }
     }
 
     public async Task SendAsync(ServerMessage message)
     {
-        byte[] bytes = Encoding.UTF8.GetBytes(ProtocolJson.Encode(message));
+        string json = ProtocolJson.Encode(message);
+        byte[] bytes = Encoding.UTF8.GetBytes(json);
+        _logger.LogInformation("[{Connection}] => {Message}", Id, Shorten(json));
 
         await _sendLock.WaitAsync();
         try
@@ -73,6 +92,7 @@ public sealed class PlayerConnection
 
     public async Task CloseAsync(string reason)
     {
+        _logger.LogInformation("[{Connection}] closing: {Reason}", Id, reason);
         await _sendLock.WaitAsync();
         try
         {
@@ -87,4 +107,6 @@ public sealed class PlayerConnection
             _sendLock.Release();
         }
     }
+
+    private static string Shorten(string text) => text.Length <= MaxLoggedChars ? text : text[..MaxLoggedChars] + $"... ({text.Length} chars)";
 }
