@@ -9,7 +9,7 @@ namespace MiniChess.Server.Matches;
 
 /// <summary>
 /// 경기 하나. 코어 GameController 를 소유하고, 두 연결의 명령을 한 번에 하나씩 처리한다(경기 상태는 이 방만 바꾼다).
-/// 연결의 팀은 방이 정하며, 각 연결에는 자기 팀 시점으로 거른 이벤트/스냅샷만 보낸다.
+/// 연결의 팀은 방이 정하며, 각 연결에는 자기 팀 시점으로 거른 스냅샷/이벤트만 보낸다(상대 덫, 포격 조준 칸 등은 빠진다).
 /// 끊김: 남은 쪽 승리로 바로 끝낸다(재접속 없음). 경기가 끝나면 두 연결을 닫는다.
 /// </summary>
 public sealed class MatchRoom
@@ -24,7 +24,6 @@ public sealed class MatchRoom
     }
 
     private readonly GameController _game;
-    private readonly int _seed;
     private readonly Seat[] _seats;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly ILogger _logger;
@@ -40,11 +39,10 @@ public sealed class MatchRoom
             new Seat { Connection = player2, Team = Team.Player2 },
         };
 
-        _seed = Random.Shared.Next();
-        _game = OnlineMatch.Create(_seed);
-
-        // 시드와 명령 순서만 있으면 경기를 그대로 재현할 수 있다.
-        _logger.LogInformation("Match {Match} created: seed={Seed}, P1={P1}, P2={P2}", Id, _seed, player1.Id, player2.Id);
+        // 시드와 명령 순서만 있으면 경기를 그대로 재현할 수 있다. 시드는 클라이언트에 보내지 않는다(무작위 결과를 미리 알 수 있다).
+        int seed = Random.Shared.Next();
+        _game = OnlineMatch.Create(seed);
+        _logger.LogInformation("Match {Match} created: seed={Seed}, P1={P1}, P2={P2}", Id, seed, player1.Id, player2.Id);
     }
 
     public async Task StartAsync()
@@ -53,7 +51,7 @@ public sealed class MatchRoom
         try
         {
             foreach (Seat seat in _seats)
-                await seat.Connection.SendAsync(new MatchStartedMessage { YourTeam = seat.Team, Seed = _seed, Snapshot = _game.GetSnapshot(seat.Team) });
+                await seat.Connection.SendAsync(new MatchStartedMessage { YourTeam = seat.Team, Snapshot = _game.GetSnapshot(seat.Team) });
         }
         finally
         {
@@ -78,12 +76,10 @@ public sealed class MatchRoom
             _logger.LogInformation("Match {Match} {Team} {Command}#{Request}: {Result}",
                 Id, seat.Team, MessageTypes.NameOf(command.GetType()), command.RequestId, outcome.Success ? "ok" : outcome.Reason);
 
-            await from.SendAsync(new CommandResultMessage { RequestId = command.RequestId, Success = outcome.Success, Reason = outcome.Reason });
+            // 바뀐 상태를 먼저 보내, 보낸 쪽이 결과를 받았을 때는 이미 새 상태로 그려져 있게 한다.
             if (outcome.Success)
-            {
-                await BroadcastAppliedAsync(seat.Team, command);
-                await BroadcastAsync(outcome.Events);
-            }
+                await BroadcastUpdateAsync(outcome.Events);
+            await from.SendAsync(new CommandResultMessage { RequestId = command.RequestId, Success = outcome.Success, Reason = outcome.Reason });
         }
         finally
         {
@@ -103,7 +99,7 @@ public sealed class MatchRoom
             if (events.Count > 0)
             {
                 _logger.LogInformation("Match {Match}: {Connection} disconnected, game ended", Id, from.Id);
-                await BroadcastAsync(events);
+                await BroadcastUpdateAsync(events);
             }
         }
         finally
@@ -114,28 +110,16 @@ public sealed class MatchRoom
         await CloseIfOverAsync();
     }
 
-    /// <summary>[임시: 클라 로컬 복제 방식] 실행한 명령을 양쪽에 알린다. 클라이언트는 같은 명령을 자기 경기에 실행한다.</summary>
-    private async Task BroadcastAppliedAsync(Team team, CommandMessage command)
-    {
-        var applied = new CommandAppliedMessage
-        {
-            Team = team,
-            CommandType = MessageTypes.NameOf(command.GetType()),
-            Command = command,
-            LastEventSequence = _game.State.Events.Count - 1,
-        };
-
-        foreach (Seat seat in _seats)
-            await seat.Connection.SendAsync(applied);
-    }
-
-    private async Task BroadcastAsync(IReadOnlyList<GameEvent> events)
+    /// <summary>바뀐 상태를 양쪽에 각자의 시점으로 걸러 보낸다.</summary>
+    private async Task BroadcastUpdateAsync(IReadOnlyList<GameEvent> events)
     {
         foreach (Seat seat in _seats)
         {
-            IReadOnlyList<GameEvent> visible = _game.GetVisibleEvents(seat.Team, events);
-            if (visible.Count > 0)
-                await seat.Connection.SendAsync(new EventsMessage { Events = visible.Select(ProtocolJson.Wrap).ToList() });
+            await seat.Connection.SendAsync(new StateUpdateMessage
+            {
+                Events = _game.GetVisibleEvents(seat.Team, events).Select(ProtocolJson.Wrap).ToList(),
+                Snapshot = _game.GetSnapshot(seat.Team),
+            });
         }
     }
 

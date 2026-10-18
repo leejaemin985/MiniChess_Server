@@ -4,6 +4,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Mvc.Testing;
 using MiniChess.Core.Characters.Pieces;
 using MiniChess.Core.Common;
+using MiniChess.Core.Snapshots;
 using MiniChess.Protocol;
 using MiniChess.Server.Protocol;
 
@@ -65,24 +66,88 @@ public class MatchFlowTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.Equal(3, stale.GetProperty("RequestId").GetInt32());
         Assert.Equal(CommandOutcome.StaleTurn, stale.GetProperty("Reason").GetString());
 
-        // [로컬 복제 방식] 시드 + 실행된 명령(배치 2, 턴 종료 1)을 그대로 실행하면 서버와 같은 이벤트 순번이 된다.
-        var mirror = OnlineMatch.Create(aStart.GetProperty("Seed").GetInt32());
-        for (int i = 0; i < 3; i++)
-        {
-            JsonElement applied = await a.NextAsync("CommandApplied");
-            Type type = MessageTypes.Find(applied.GetProperty("CommandType").GetString())!;
-            var command = (CommandMessage)applied.GetProperty("Command").Deserialize(type, ProtocolJson.Options)!;
-            Team team = Enum.Parse<Team>(applied.GetProperty("Team").GetString()!);
-
-            Assert.True(CommandExecutor.Execute(mirror, team, command).Success);
-            Assert.Equal(applied.GetProperty("LastEventSequence").GetInt32(), mirror.State.Events.Count - 1);
-        }
+        // 상태 변화(배치 2, 턴 종료 1)마다 받은 스냅샷으로 경기를 다시 만들 수 있고, 턴 번호가 서버를 따라간다.
+        Assert.Null(aStart.GetProperty("Snapshot").GetProperty("Winner").GetString());
+        Assert.False(aStart.TryGetProperty("Seed", out _));
+        Assert.Equal(turnNumber + 1, a.LatestSnapshot!.Value.GetProperty("TurnNumber").GetInt32());
+        var restored = OnlineMatch.Restore(OnlineMatch.CreateConfig(), a.LatestSnapshot.Value.Deserialize<GameSnapshot>(ProtocolJson.Options)!);
+        Assert.Equal(8, restored.State.AllUnits().Count(unit => unit.IsOnBoard));
 
         // 기다리던 쪽이 끊기면 턴을 가진 쪽 승리로 끝난다.
         await waiting.DisposeAsync();
         JsonElement ended = await active.NextEventAsync("GameEndedEvent");
         Assert.Equal(activeTeam, ended.GetProperty("Winner").GetString());
         Assert.Equal("Disconnect", ended.GetProperty("Reason").GetString());
+    }
+
+    // 숨김 규칙이 실제 전송에도 적용되는지: 덫을 놓으면 상대에게는 스킬 사용만 가고 덫 위치는 가지 않는다.
+    [Fact]
+    public async Task EnemyTrap_IsNotSentToOpponent()
+    {
+        await using TestClient a = await ConnectAsync();
+        await using TestClient b = await ConnectAsync();
+        await a.SendAsync(new JoinMatchMessage { ProtocolVersion = ProtocolInfo.Version });
+        await b.SendAsync(new JoinMatchMessage { ProtocolVersion = ProtocolInfo.Version });
+        JsonElement aStart = await a.NextAsync("MatchStarted");
+        JsonElement bStart = await b.NextAsync("MatchStarted");
+
+        await a.SendAsync(Placement(aStart, requestId: 1));
+        await b.SendAsync(Placement(bStart, requestId: 1));
+        await a.NextAsync("CommandResult");
+        await b.NextAsync("CommandResult");
+        JsonElement turnStarted = await a.NextEventAsync("TurnStartedEvent");
+        await b.NextEventAsync("TurnStartedEvent");
+
+        bool aFirst = turnStarted.GetProperty("Team").GetString() == aStart.GetProperty("YourTeam").GetString();
+        TestClient active = aFirst ? a : b;
+        TestClient waiting = aFirst ? b : a;
+        JsonElement chemist = active.LatestSnapshot!.Value.GetProperty("Units").EnumerateArray()
+            .Single(unit => unit.GetProperty("CharacterId").GetString() == ChemistPiece.PieceId
+                && unit.GetProperty("Team").GetString() == turnStarted.GetProperty("Team").GetString());
+        var trapCell = Forward(chemist.GetProperty("Position"), active == a ? aStart : bStart);
+
+        await active.SendAsync(new UseSkillMessage
+        {
+            RequestId = 2,
+            TurnNumber = turnStarted.GetProperty("TurnNumber").GetInt32(),
+            UnitId = chemist.GetProperty("Id").GetInt32(),
+            SkillId = ChemistPiece.RootTrapId,
+            Targets = new List<Position> { trapCell },
+        });
+        JsonElement result = await active.NextAsync("CommandResult");
+        Assert.True(result.GetProperty("Success").GetBoolean(), result.GetProperty("Reason").GetString());
+
+        JsonElement mine = await NextUpdateWithAsync(active, "SkillUsedEvent");
+        JsonElement theirs = await NextUpdateWithAsync(waiting, "SkillUsedEvent");
+        string[] theirTypes = EventTypesOf(theirs);
+        Assert.Contains("CellEffectPlacedEvent", EventTypesOf(mine));
+        Assert.Equal(new[] { "SkillUsedEvent" }, theirTypes);
+        Assert.Empty(theirs.GetProperty("Events")[0].GetProperty("Payload").GetProperty("Targets").EnumerateArray());
+        Assert.Single(mine.GetProperty("Snapshot").GetProperty("CellEffects").EnumerateArray());
+        Assert.Empty(theirs.GetProperty("Snapshot").GetProperty("CellEffects").EnumerateArray());
+    }
+
+    /// <summary>eventType 이벤트가 든 상태 변화가 나올 때까지 앞의 상태 변화를 넘긴다.</summary>
+    private static async Task<JsonElement> NextUpdateWithAsync(TestClient client, string eventType)
+    {
+        while (true)
+        {
+            JsonElement update = await client.NextAsync("StateUpdate");
+            if (EventTypesOf(update).Contains(eventType))
+                return update;
+        }
+    }
+
+    private static string[] EventTypesOf(JsonElement stateUpdate)
+    {
+        return stateUpdate.GetProperty("Events").EnumerateArray().Select(e => e.GetProperty("Type").GetString()!).ToArray();
+    }
+
+    /// <summary>position 과 같은 열에서 시작 구역 바로 앞의 빈 칸(프리셋 7x7 맵: Player1 은 y=2, Player2 는 y=4).</summary>
+    private static Position Forward(JsonElement position, JsonElement matchStarted)
+    {
+        bool bottom = matchStarted.GetProperty("YourTeam").GetString() == nameof(Team.Player1);
+        return new Position(position.GetProperty("X").GetInt32(), bottom ? 2 : 4);
     }
 
     [Fact]
@@ -100,7 +165,7 @@ public class MatchFlowTests : IClassFixture<WebApplicationFactory<Program>>
         JsonElement snapshot = matchStarted.GetProperty("Snapshot");
         string team = matchStarted.GetProperty("YourTeam").GetString()!;
         JsonElement player = snapshot.GetProperty("Players").EnumerateArray().Single(p => p.GetProperty("Team").GetString() == team);
-        string[] lineup = { WarriorPiece.PieceId, ArcherPiece.PieceId, GardenerPiece.PieceId, ScythePiece.PieceId };
+        string[] lineup = { ChemistPiece.PieceId, ArcherPiece.PieceId, GardenerPiece.PieceId, ScythePiece.PieceId };
 
         return new PlaceUnitsMessage
         {
@@ -133,6 +198,9 @@ public class MatchFlowTests : IClassFixture<WebApplicationFactory<Program>>
         private readonly List<JsonElement> _messages = new();
         private readonly Queue<JsonElement> _events = new();
         private bool _disposed;
+
+        /// <summary>마지막으로 받은 경기 상태(MatchStarted 또는 StateUpdate 의 스냅샷).</summary>
+        public JsonElement? LatestSnapshot { get; private set; }
 
         public TestClient(WebSocket socket)
         {
@@ -197,15 +265,18 @@ public class MatchFlowTests : IClassFixture<WebApplicationFactory<Program>>
 
             Assert.Equal(WebSocketMessageType.Text, result.MessageType);
             JsonElement message = JsonDocument.Parse(stream.ToArray()).RootElement.Clone();
-            if (message.GetProperty("Type").GetString() == "Events")
+            string? type = message.GetProperty("Type").GetString();
+            JsonElement payload = message.GetProperty("Payload");
+            if (type == "StateUpdate")
             {
-                foreach (JsonElement envelope in message.GetProperty("Payload").GetProperty("Events").EnumerateArray())
+                foreach (JsonElement envelope in payload.GetProperty("Events").EnumerateArray())
                     _events.Enqueue(envelope);
             }
-            else
-            {
-                _messages.Add(message);
-            }
+
+            if (type is "StateUpdate" or "MatchStarted")
+                LatestSnapshot = payload.GetProperty("Snapshot");
+
+            _messages.Add(message);
         }
 
         public async ValueTask DisposeAsync()
