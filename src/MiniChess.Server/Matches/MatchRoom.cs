@@ -1,16 +1,19 @@
 using MiniChess.Core.Common;
 using MiniChess.Core.Controller;
 using MiniChess.Core.Events;
+using MiniChess.Core.State;
 using MiniChess.Protocol;
 using MiniChess.Server.Connections;
-using MiniChess.Server.Protocol;
 
 namespace MiniChess.Server.Matches;
 
 /// <summary>
-/// 경기 하나. 코어 GameController 를 소유하고, 두 연결의 명령을 한 번에 하나씩 처리한다(경기 상태는 이 방만 바꾼다).
-/// 연결의 팀은 방이 정하며, 각 연결에는 자기 팀 시점으로 거른 스냅샷/이벤트만 보낸다(상대 덫, 포격 조준 칸 등은 빠진다).
-/// 끊김: 남은 쪽 승리로 바로 끝낸다(재접속 없음). 경기가 끝나면 두 연결을 닫는다.
+/// 경기 하나. 코어 GameController 를 소유하고, 두 연결의 명령과 턴 시간 초과를 한 번에 하나씩 처리한다(경기 상태는 이 방만 바꾼다).
+/// 연결의 팀은 방이 정하며, 각 연결에는 자기 팀 시점으로 거른 스냅샷/이벤트만 보낸다(상대 덫, 포격 조준 칸, 배치 단계의 상대 배치 등은 빠진다).
+///   - 끊김: 남은 쪽 승리로 바로 끝낸다(재접속 없음).
+///   - 턴 시간 초과(MatchOptions.TurnTime): 서버가 그 팀의 턴을 끝낸다. 배치 단계에는 제한이 없다.
+///   - 코어 예외: 상태가 처리 도중에 멈췄을 수 있으므로 경기를 무효 처리하고(승자 없음) 양쪽에 알린다.
+/// 경기가 끝나면 두 연결을 닫는다. 보내기는 큐에 넣기만 하므로 잠금을 쥔 채 네트워크를 기다리지 않는다.
 /// </summary>
 public sealed class MatchRoom
 {
@@ -19,19 +22,28 @@ public sealed class MatchRoom
         public required PlayerConnection Connection { get; init; }
         public required Team Team { get; init; }
 
-        /// <summary>처리한 마지막 요청 번호. 이 이하의 번호는 재전송으로 보고 무시한다.</summary>
+        /// <summary>처리한 마지막 요청 번호. 같은 번호가 다시 오면 저장해 둔 결과를 다시 보내고, 더 작은 번호는 무시한다.</summary>
         public int LastRequestId { get; set; }
+
+        public CommandResultMessage? LastResult { get; set; }
     }
 
     private readonly GameController _game;
     private readonly Seat[] _seats;
     private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly MatchOptions _options;
     private readonly ILogger _logger;
+
+    /// <summary>시간을 재고 있는 턴 번호와 마감 시각. 턴이 없으면(배치 단계, 경기 종료) null.</summary>
+    private int? _timedTurn;
+    private DateTime _turnDeadline;
+    private CancellationTokenSource? _turnTimer;
 
     public string Id { get; } = Guid.NewGuid().ToString("N")[..8];
 
-    public MatchRoom(PlayerConnection player1, PlayerConnection player2, ILogger logger)
+    public MatchRoom(PlayerConnection player1, PlayerConnection player2, MatchOptions options, ILogger logger)
     {
+        _options = options;
         _logger = logger;
         _seats = new[]
         {
@@ -41,7 +53,7 @@ public sealed class MatchRoom
 
         // 시드와 명령 순서만 있으면 경기를 그대로 재현할 수 있다. 시드는 클라이언트에 보내지 않는다(무작위 결과를 미리 알 수 있다).
         int seed = Random.Shared.Next();
-        _game = OnlineMatch.Create(seed);
+        _game = options.CreateGame(seed);
         _logger.LogInformation("Match {Match} created: seed={Seed}, P1={P1}, P2={P2}", Id, seed, player1.Id, player2.Id);
     }
 
@@ -51,7 +63,7 @@ public sealed class MatchRoom
         try
         {
             foreach (Seat seat in _seats)
-                await seat.Connection.SendAsync(new MatchStartedMessage { YourTeam = seat.Team, Snapshot = _game.GetSnapshot(seat.Team) });
+                seat.Connection.Send(new MatchStartedMessage { YourTeam = seat.Team, Snapshot = _game.GetSnapshot(seat.Team) });
         }
         finally
         {
@@ -65,28 +77,33 @@ public sealed class MatchRoom
         try
         {
             Seat seat = SeatOf(from);
-            if (command.RequestId <= seat.LastRequestId)
+            if (command.RequestId < seat.LastRequestId)
                 return;
-            seat.LastRequestId = command.RequestId;
+            if (command.RequestId == seat.LastRequestId && seat.LastResult != null)
+            {
+                from.Send(seat.LastResult);
+                return;
+            }
 
-            CommandOutcome outcome = _game.State.IsGameOver
-                ? CommandOutcome.Fail(CommandOutcome.GameOver)
-                : CommandExecutor.Execute(_game, seat.Team, command);
+            seat.LastRequestId = command.RequestId;
+            CommandOutcome outcome = Execute(seat.Team, command);
 
             _logger.LogInformation("Match {Match} {Team} {Command}#{Request}: {Result}",
                 Id, seat.Team, MessageTypes.NameOf(command.GetType()), command.RequestId, outcome.Success ? "ok" : outcome.Reason);
 
             // 바뀐 상태를 먼저 보내, 보낸 쪽이 결과를 받았을 때는 이미 새 상태로 그려져 있게 한다.
-            if (outcome.Success)
-                await BroadcastUpdateAsync(outcome.Events);
-            await from.SendAsync(new CommandResultMessage { RequestId = command.RequestId, Success = outcome.Success, Reason = outcome.Reason });
+            if (outcome.Events.Count > 0)
+                BroadcastUpdate(outcome.Events);
+
+            seat.LastResult = new CommandResultMessage { RequestId = command.RequestId, Success = outcome.Success, Reason = outcome.Reason };
+            from.Send(seat.LastResult);
         }
         finally
         {
             _lock.Release();
         }
 
-        await CloseIfOverAsync();
+        CloseIfOver();
     }
 
     /// <summary>연결이 끊겼다. 진행 중이면 남은 쪽 승리로 끝낸다.</summary>
@@ -99,7 +116,7 @@ public sealed class MatchRoom
             if (events.Count > 0)
             {
                 _logger.LogInformation("Match {Match}: {Connection} disconnected, game ended", Id, from.Id);
-                await BroadcastUpdateAsync(events);
+                BroadcastUpdate(events);
             }
         }
         finally
@@ -107,29 +124,132 @@ public sealed class MatchRoom
             _lock.Release();
         }
 
-        await CloseIfOverAsync();
+        CloseIfOver();
     }
 
-    /// <summary>바뀐 상태를 양쪽에 각자의 시점으로 걸러 보낸다.</summary>
-    private async Task BroadcastUpdateAsync(IReadOnlyList<GameEvent> events)
+    /// <summary>명령을 실행한다. 코어가 예외를 던지면 경기를 무효 처리하고 그 종료 이벤트를 결과로 돌려준다.</summary>
+    private CommandOutcome Execute(Team team, CommandMessage command)
     {
-        foreach (Seat seat in _seats)
+        if (_game.State.IsGameOver)
+            return CommandOutcome.Fail(CommandOutcome.GameOver);
+
+        try
         {
-            await seat.Connection.SendAsync(new StateUpdateMessage
-            {
-                Events = _game.GetVisibleEvents(seat.Team, events).Select(ProtocolJson.Wrap).ToList(),
-                Snapshot = _game.GetSnapshot(seat.Team),
-            });
+            return CommandExecutor.Execute(_game, team, command);
+        }
+        catch (Exception exception)
+        {
+            _logger.LogError(exception, "Match {Match}: core error while running {Team} {Command}; match aborted",
+                Id, team, MessageTypes.NameOf(command.GetType()));
+            return CommandOutcome.Aborted(_game.Abort());
         }
     }
 
-    private async Task CloseIfOverAsync()
+    /// <summary>턴 시간이 다 되었다. 그 턴이 아직 진행 중이면 현재 팀의 턴을 끝낸다.</summary>
+    private async Task OnTurnTimeoutAsync(int turnNumber)
+    {
+        await _lock.WaitAsync();
+        try
+        {
+            if (_game.State.IsGameOver || _game.State.Phase != GamePhase.Battle || _game.State.TurnNumber != turnNumber)
+                return;
+
+            Team team = _game.State.CurrentTeam;
+            _logger.LogInformation("Match {Match}: turn {Turn} ({Team}) timed out, ending turn", Id, turnNumber, team);
+
+            IReadOnlyList<GameEvent> events;
+            try
+            {
+                var response = _game.EndTurn(new EndTurnRequest(team));
+                events = response.Events;
+            }
+            catch (Exception exception)
+            {
+                _logger.LogError(exception, "Match {Match}: core error while ending turn {Turn} on timeout; match aborted", Id, turnNumber);
+                events = _game.Abort();
+            }
+
+            if (events.Count > 0)
+                BroadcastUpdate(events);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+
+        CloseIfOver();
+    }
+
+    /// <summary>
+    /// 바뀐 상태를 양쪽에 각자의 시점으로 걸러 보낸다(잠금 안에서 호출). 턴이 바뀌었으면 턴 시간을 새로 잰다.
+    /// 시점 만들기가 실패하면(코어 상태 이상) 경기를 무효 처리하고 오류만 알린다.
+    /// </summary>
+    private void BroadcastUpdate(IReadOnlyList<GameEvent> events)
+    {
+        RestartTurnTimerIfNeeded();
+
+        List<(Seat Seat, StateUpdateMessage Update)> updates;
+        try
+        {
+            updates = _seats.Select(seat => (seat, new StateUpdateMessage
+            {
+                Events = _game.GetVisibleEvents(seat.Team, events).Select(ProtocolJson.Wrap).ToList(),
+                Snapshot = _game.GetSnapshot(seat.Team),
+                TurnTimeLeftMs = TurnTimeLeftMs(),
+            })).ToList();
+        }
+        catch (Exception exception)
+        {
+            _logger.LogError(exception, "Match {Match}: could not build state updates; match aborted", Id);
+            if (!_game.State.IsGameOver)
+                _game.Abort();
+            foreach (Seat seat in _seats)
+                seat.Connection.Send(new ErrorMessage { Message = "서버 오류로 경기가 무효 처리되었습니다" });
+            return;
+        }
+
+        foreach ((Seat seat, StateUpdateMessage update) in updates)
+            seat.Connection.Send(update);
+    }
+
+    private void RestartTurnTimerIfNeeded()
+    {
+        GameState state = _game.State;
+        int? turn = state.Phase == GamePhase.Battle && !state.IsGameOver ? state.TurnNumber : null;
+        if (turn == _timedTurn)
+            return;
+
+        _turnTimer?.Cancel();
+        _turnTimer = null;
+        _timedTurn = turn;
+        if (turn == null)
+            return;
+
+        var timer = new CancellationTokenSource();
+        _turnTimer = timer;
+        _turnDeadline = DateTime.UtcNow + _options.TurnTime;
+        int turnNumber = turn.Value;
+        _ = Task.Delay(_options.TurnTime, timer.Token).ContinueWith(
+            delay => delay.IsCompletedSuccessfully ? OnTurnTimeoutAsync(turnNumber) : Task.CompletedTask,
+            TaskScheduler.Default).Unwrap();
+    }
+
+    private int? TurnTimeLeftMs()
+    {
+        if (_timedTurn == null)
+            return null;
+
+        return Math.Max(0, (int)(_turnDeadline - DateTime.UtcNow).TotalMilliseconds);
+    }
+
+    private void CloseIfOver()
     {
         if (!_game.State.IsGameOver)
             return;
 
+        _turnTimer?.Cancel();
         foreach (Seat seat in _seats)
-            await seat.Connection.CloseAsync("game over");
+            seat.Connection.Close("game over");
     }
 
     private Seat SeatOf(PlayerConnection connection) => _seats.First(seat => seat.Connection == connection);
