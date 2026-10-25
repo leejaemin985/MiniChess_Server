@@ -257,7 +257,7 @@ public class MatchFlowTests : IClassFixture<WebApplicationFactory<Program>>
         foreach (SkillDefinition skill in config.Skills.All.Where(skill => skill.Id != ChemistPiece.RootTrapId))
             skills.Add(skill);
         skills.Add(new SkillDefinition(
-            ChemistPiece.RootTrapId, "폭발", 1, SkillActionKind.Combat,
+            ChemistPiece.RootTrapId, "폭발", 1,
             new CellTargeting(2, CellRequirement.Empty), PatternArea.SingleCell, new SkillEffect[] { new ExplodingEffect() }));
 
         config.Skills = skills;
