@@ -27,6 +27,9 @@ public sealed class PlayerConnection
     private readonly Channel<Outgoing> _outbox = Channel.CreateBounded<Outgoing>(MaxQueuedMessages);
     private readonly Task _sendLoop;
 
+    /// <summary>닫기(Close/Flush/Abort)를 시작해 더는 메시지를 받지 않는다. 이후의 Send 는 끊지 않고 버린다.</summary>
+    private volatile bool _closing;
+
     /// <summary>보낼 것 하나: 메시지(Json) 또는 닫기 요청(CloseReason).</summary>
     private readonly record struct Outgoing(string? Json, string? CloseReason);
 
@@ -90,19 +93,28 @@ public sealed class PlayerConnection
         }
     }
 
-    /// <summary>메시지를 보낼 큐에 넣는다. 큐가 넘치면(상대가 받지 않음) 연결을 끊는다.</summary>
+    /// <summary>
+    /// 메시지를 보낼 큐에 넣는다. 큐가 넘치면(상대가 받지 않음) 연결을 끊는다.
+    /// 닫기를 시작한 뒤의 메시지(경기 종료 직후 도착한 Ping 의 응답 등)는 버린다. 끊어 버리면 큐에 남은 경기 종료 메시지가 사라진다.
+    /// </summary>
     public void Send(ServerMessage message)
     {
         string json = ProtocolJson.Encode(message);
         _logger.LogDebug("[{Connection}] => {Message}", Id, Shorten(json));
 
-        if (!_outbox.Writer.TryWrite(new Outgoing(json, null)))
+        if (_outbox.Writer.TryWrite(new Outgoing(json, null)))
+            return;
+
+        if (_closing)
+            _logger.LogDebug("[{Connection}] dropped after close: {Message}", Id, Shorten(json));
+        else
             Abort("send queue full");
     }
 
     /// <summary>앞서 넣은 메시지를 모두 보낸 뒤 닫는다.</summary>
     public void Close(string reason)
     {
+        _closing = true;
         _outbox.Writer.TryWrite(new Outgoing(null, reason));
         _outbox.Writer.TryComplete();
     }
@@ -110,6 +122,7 @@ public sealed class PlayerConnection
     /// <summary>보내기 루프가 남은 메시지를 다 보낼 때까지 기다린다(연결 처리를 끝내기 전에 호출).</summary>
     public async Task FlushAsync()
     {
+        _closing = true;
         _outbox.Writer.TryComplete();
         await Task.WhenAny(_sendLoop, Task.Delay(_options.SendTimeout));
     }
@@ -147,6 +160,7 @@ public sealed class PlayerConnection
     private void Abort(string reason)
     {
         _logger.LogInformation("[{Connection}] aborting: {Reason}", Id, reason);
+        _closing = true;
         _outbox.Writer.TryComplete();
         _socket.Abort();
     }
