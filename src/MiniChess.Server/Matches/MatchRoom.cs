@@ -10,7 +10,7 @@ namespace MiniChess.Server.Matches;
 /// <summary>
 /// 경기 하나. 코어 GameController 를 소유하고, 두 연결의 명령과 턴 시간 초과를 한 번에 하나씩 처리한다(경기 상태는 이 방만 바꾼다).
 /// 연결의 팀은 방이 정하며, 각 연결에는 자기 팀 시점으로 거른 스냅샷/이벤트만 보낸다(상대 덫, 포격 조준 칸, 배치 단계의 상대 배치 등은 빠진다).
-///   - 끊김: 남은 쪽 승리로 바로 끝낸다(재접속 없음).
+///   - 끊김: 남은 쪽 승리로 바로 끝낸다(재접속 없음). 배치 단계에 끊기면 승자 없이 끝낸다.
 ///   - 턴 시간 초과(MatchOptions.TurnTime): 서버가 그 팀의 턴을 끝낸다.
 ///   - 배치 시간 초과(MatchOptions.SetupTime): 서버가 아직 배치하지 않은 팀을 무작위로 배치한다(경기 시드 기반, OnlineMatch.RandomPlacement).
 ///   - 코어 예외: 상태가 처리 도중에 멈췄을 수 있으므로 경기를 무효 처리하고(승자 없음) 양쪽에 알린다.
@@ -62,9 +62,13 @@ public sealed class MatchRoom
         _logger.LogInformation("Match {Match} created: seed={Seed}, P1={P1}, P2={P2}", Id, seed, player1.Id, player2.Id);
     }
 
-    public async Task StartAsync()
+    /// <summary>
+    /// 양쪽에 경기 시작을 보내고 배치 시간을 잰다. 로비가 짝지으면서 두 연결에 방을 알려 주기 전에 부른다.
+    /// 그래야 짝짓기 직후 한쪽이 끊겨도 경기 시작이 종료 알림보다 먼저 나간다.
+    /// </summary>
+    public void Start()
     {
-        await _lock.WaitAsync();
+        _lock.Wait();
         try
         {
             RestartTurnTimerIfNeeded();

@@ -45,9 +45,7 @@ public sealed class Lobby
         var session = new Session { Connection = connection };
         try
         {
-            MatchRoom? room = Pair(session);
-            if (room != null)
-                await room.StartAsync();
+            Pair(session);
 
             while (await connection.ReceiveAsync(cancellationToken) is { } text)
                 await HandleAsync(session, ProtocolJson.DecodeClient(text));
@@ -99,8 +97,12 @@ public sealed class Lobby
         }
     }
 
-    /// <summary>대기자가 있으면 짝지어 방을 만들고, 없으면 대기자가 된다.</summary>
-    private MatchRoom? Pair(Session session)
+    /// <summary>
+    /// 대기자가 있으면 짝지어 방을 만들고 경기를 시작하며, 없으면 대기자가 된다.
+    /// 경기 시작을 보낸 뒤에 방을 알려 준다. 대기자가 이 사이에 끊기면 퇴장 처리(LeaveAsync)가 방을 보고 경기를 끝내는데,
+    /// 그 종료 알림이 경기 시작보다 먼저 나가면 안 된다.
+    /// </summary>
+    private void Pair(Session session)
     {
         lock (_gate)
         {
@@ -108,16 +110,16 @@ public sealed class Lobby
             {
                 _waiting = session;
                 _logger.LogInformation("{Connection} waiting for opponent", session.Connection.Id);
-                return null;
+                return;
             }
 
             Session opponent = _waiting;
             _waiting = null;
 
             var room = new MatchRoom(opponent.Connection, session.Connection, _options, _logger);
+            room.Start();
             opponent.Room = room;
             session.Room = room;
-            return room;
         }
     }
 

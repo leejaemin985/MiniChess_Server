@@ -217,22 +217,39 @@ public class MatchFlowTests : IClassFixture<WebApplicationFactory<Program>>
             && unit.GetProperty("CharacterId").GetString() == ChemistPiece.PieceId);
     }
 
-    // 아무것도 보내지 않는(반쯤 끊긴) 연결은 제한 시간 뒤 끊긴 것으로 보고, 상대가 이긴다.
+    // 아무것도 보내지 않는(반쯤 끊긴) 연결은 제한 시간 뒤 끊긴 것으로 보고, 전투 중이면 상대가 이긴다.
     [Fact]
     public async Task SilentConnection_TimesOut_AndOpponentWins()
     {
         WebApplicationFactory<Program> server = WithOptions(options => options.ConnectionTimeout = TimeSpan.FromMilliseconds(600));
-        var (a, b, _, bStart) = await StartMatchAsync(server);
+        var (a, b, aStart, bStart) = await StartMatchAsync(server);
         await using var _a = a;
         await using var _b = b;
         using var keepAlive = new CancellationTokenSource();
         Task pinging = b.PingUntilAsync(TimeSpan.FromMilliseconds(150), keepAlive.Token);
+        await a.SendAsync(Placement(aStart, requestId: 1));
+        await b.SendAsync(Placement(bStart, requestId: 1));
+        await b.NextEventAsync("TurnStartedEvent");
 
         JsonElement ended = await b.NextEventAsync("GameEndedEvent");
 
         keepAlive.Cancel();
         await pinging;
         Assert.Equal(bStart.GetProperty("YourTeam").GetString(), ended.GetProperty("Winner").GetString());
+        Assert.Equal("Disconnect", ended.GetProperty("Reason").GetString());
+    }
+
+    // 배치 단계(전투 전)에 끊기면 승자 없이 끝난다. 이미 끊긴 대기자와 짝지어져 싸우지 않고 이기는 것을 막는다.
+    [Fact]
+    public async Task DisconnectDuringSetup_EndsWithoutAWinner()
+    {
+        var (a, b, _, _) = await StartMatchAsync(_factory);
+        await using var _b = b;
+
+        await a.DisposeAsync();
+        JsonElement ended = await b.NextEventAsync("GameEndedEvent");
+
+        Assert.Equal(JsonValueKind.Null, ended.GetProperty("Winner").ValueKind);
         Assert.Equal("Disconnect", ended.GetProperty("Reason").GetString());
     }
 
