@@ -11,7 +11,8 @@ namespace MiniChess.Server.Matches;
 /// 경기 하나. 코어 GameController 를 소유하고, 두 연결의 명령과 턴 시간 초과를 한 번에 하나씩 처리한다(경기 상태는 이 방만 바꾼다).
 /// 연결의 팀은 방이 정하며, 각 연결에는 자기 팀 시점으로 거른 스냅샷/이벤트만 보낸다(상대 덫, 포격 조준 칸, 배치 단계의 상대 배치 등은 빠진다).
 ///   - 끊김: 남은 쪽 승리로 바로 끝낸다(재접속 없음).
-///   - 턴 시간 초과(MatchOptions.TurnTime): 서버가 그 팀의 턴을 끝낸다. 배치 단계에는 제한이 없다.
+///   - 턴 시간 초과(MatchOptions.TurnTime): 서버가 그 팀의 턴을 끝낸다.
+///   - 배치 시간 초과(MatchOptions.SetupTime): 서버가 아직 배치하지 않은 팀을 무작위로 배치한다(경기 시드 기반, OnlineMatch.RandomPlacement).
 ///   - 코어 예외: 상태가 처리 도중에 멈췄을 수 있으므로 경기를 무효 처리하고(승자 없음) 양쪽에 알린다.
 /// 경기가 끝나면 두 연결을 닫는다. 보내기는 큐에 넣기만 하므로 잠금을 쥔 채 네트워크를 기다리지 않는다.
 /// </summary>
@@ -34,7 +35,10 @@ public sealed class MatchRoom
     private readonly MatchOptions _options;
     private readonly ILogger _logger;
 
-    /// <summary>시간을 재고 있는 턴 번호와 마감 시각. 턴이 없으면(배치 단계, 경기 종료) null.</summary>
+    /// <summary>배치 시간 초과 때 무작위 배치에 쓰는 난수(경기 시드에서 만든다. 경기 안의 난수와는 따로).</summary>
+    private readonly Random _placementRandom;
+
+    /// <summary>시간을 재고 있는 턴 번호(배치 단계는 0)와 마감 시각. 경기가 끝났으면 null.</summary>
     private int? _timedTurn;
     private DateTime _turnDeadline;
     private CancellationTokenSource? _turnTimer;
@@ -54,6 +58,7 @@ public sealed class MatchRoom
         // 시드와 명령 순서만 있으면 경기를 그대로 재현할 수 있다. 시드는 클라이언트에 보내지 않는다(무작위 결과를 미리 알 수 있다).
         int seed = Random.Shared.Next();
         _game = options.CreateGame(seed);
+        _placementRandom = new Random(seed);
         _logger.LogInformation("Match {Match} created: seed={Seed}, P1={P1}, P2={P2}", Id, seed, player1.Id, player2.Id);
     }
 
@@ -62,8 +67,14 @@ public sealed class MatchRoom
         await _lock.WaitAsync();
         try
         {
+            RestartTurnTimerIfNeeded();
             foreach (Seat seat in _seats)
-                seat.Connection.Send(new MatchStartedMessage { YourTeam = seat.Team, Snapshot = _game.GetSnapshot(seat.Team) });
+            {
+                seat.Connection.Send(new MatchStartedMessage
+                {
+                    YourTeam = seat.Team, Snapshot = _game.GetSnapshot(seat.Team), TurnTimeLeftMs = TurnTimeLeftMs(),
+                });
+            }
         }
         finally
         {
@@ -145,27 +156,26 @@ public sealed class MatchRoom
         }
     }
 
-    /// <summary>턴 시간이 다 되었다. 그 턴이 아직 진행 중이면 현재 팀의 턴을 끝낸다.</summary>
+    /// <summary>
+    /// 턴(배치 단계면 배치) 시간이 다 되었다. 그 턴이 아직 진행 중이면 현재 팀의 턴을 끝낸다.
+    /// 배치 단계면 아직 배치하지 않은 팀을 무작위로 배치한다(두 팀 모두 배치되면 전투가 시작된다).
+    /// </summary>
     private async Task OnTurnTimeoutAsync(int turnNumber)
     {
         await _lock.WaitAsync();
         try
         {
-            if (_game.State.IsGameOver || _game.State.Phase != GamePhase.Battle || _game.State.TurnNumber != turnNumber)
+            if (_game.State.IsGameOver || _game.State.TurnNumber != turnNumber)
                 return;
-
-            Team team = _game.State.CurrentTeam;
-            _logger.LogInformation("Match {Match}: turn {Turn} ({Team}) timed out, ending turn", Id, turnNumber, team);
 
             IReadOnlyList<GameEvent> events;
             try
             {
-                var response = _game.EndTurn(new EndTurnRequest(team));
-                events = response.Events;
+                events = _game.State.Phase == GamePhase.Setup ? PlaceRemainingTeams() : EndCurrentTurn(turnNumber);
             }
             catch (Exception exception)
             {
-                _logger.LogError(exception, "Match {Match}: core error while ending turn {Turn} on timeout; match aborted", Id, turnNumber);
+                _logger.LogError(exception, "Match {Match}: core error while handling timeout of turn {Turn}; match aborted", Id, turnNumber);
                 events = _game.Abort();
             }
 
@@ -178,6 +188,30 @@ public sealed class MatchRoom
         }
 
         CloseIfOver();
+    }
+
+    private IReadOnlyList<GameEvent> EndCurrentTurn(int turnNumber)
+    {
+        Team team = _game.State.CurrentTeam;
+        _logger.LogInformation("Match {Match}: turn {Turn} ({Team}) timed out, ending turn", Id, turnNumber, team);
+        return _game.EndTurn(new EndTurnRequest(team)).Events;
+    }
+
+    /// <summary>배치하지 않은 팀을 무작위로 배치한다. 배치 규칙에 맞게 만들므로 실패하면 코어 이상으로 본다.</summary>
+    private IReadOnlyList<GameEvent> PlaceRemainingTeams()
+    {
+        var events = new List<GameEvent>();
+        foreach (Seat seat in _seats.Where(seat => !_game.State.GetPlayer(seat.Team).HasPlaced))
+        {
+            _logger.LogInformation("Match {Match}: setup timed out, placing {Team} at random", Id, seat.Team);
+            var response = _game.PlaceUnits(OnlineMatch.RandomPlacement(_game, seat.Team, _placementRandom));
+            if (!response.Success)
+                throw new InvalidOperationException($"무작위 배치 실패({seat.Team}): {response.Reason}");
+
+            events.AddRange(response.Events);
+        }
+
+        return events;
     }
 
     /// <summary>
@@ -215,7 +249,7 @@ public sealed class MatchRoom
     private void RestartTurnTimerIfNeeded()
     {
         GameState state = _game.State;
-        int? turn = state.Phase == GamePhase.Battle && !state.IsGameOver ? state.TurnNumber : null;
+        int? turn = state.IsGameOver ? null : state.TurnNumber;
         if (turn == _timedTurn)
             return;
 
@@ -227,9 +261,10 @@ public sealed class MatchRoom
 
         var timer = new CancellationTokenSource();
         _turnTimer = timer;
-        _turnDeadline = DateTime.UtcNow + _options.TurnTime;
+        TimeSpan limit = state.Phase == GamePhase.Setup ? _options.SetupTime : _options.TurnTime;
+        _turnDeadline = DateTime.UtcNow + limit;
         int turnNumber = turn.Value;
-        _ = Task.Delay(_options.TurnTime, timer.Token).ContinueWith(
+        _ = Task.Delay(limit, timer.Token).ContinueWith(
             delay => delay.IsCompletedSuccessfully ? OnTurnTimeoutAsync(turnNumber) : Task.CompletedTask,
             TaskScheduler.Default).Unwrap();
     }

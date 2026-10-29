@@ -9,6 +9,9 @@ public sealed class MatchOptions
     /// <summary>한 턴의 제한 시간. 다 되면 서버가 그 팀의 턴을 끝낸다.</summary>
     public TimeSpan TurnTime { get; set; } = TimeSpan.FromSeconds(OnlineMatch.TurnTimeSeconds);
 
+    /// <summary>배치 단계의 제한 시간. 다 되면 서버가 아직 배치하지 않은 팀을 무작위로 배치한다.</summary>
+    public TimeSpan SetupTime { get; set; } = TimeSpan.FromSeconds(OnlineMatch.SetupTimeSeconds);
+
     /// <summary>이 시간 동안 클라이언트에게서 아무 메시지도 받지 못하면 끊긴 것으로 본다.</summary>
     public TimeSpan ConnectionTimeout { get; set; } = TimeSpan.FromSeconds(ProtocolInfo.ConnectionTimeoutSeconds);
 

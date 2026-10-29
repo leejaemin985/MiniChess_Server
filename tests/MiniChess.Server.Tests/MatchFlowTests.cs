@@ -196,6 +196,27 @@ public class MatchFlowTests : IClassFixture<WebApplicationFactory<Program>>
         await b.NextEventAsync("TurnEndedEvent");
     }
 
+    // 배치 시간이 다 되면 서버가 배치하지 않은 팀을 무작위로 배치하고 전투가 시작된다(먼저 배치한 팀의 배치는 그대로).
+    [Fact]
+    public async Task SetupTimeout_PlacesTheRemainingTeamAtRandom_AndStartsTheBattle()
+    {
+        WebApplicationFactory<Program> server = WithOptions(options => options.SetupTime = TimeSpan.FromMilliseconds(300));
+        var (a, b, aStart, _) = await StartMatchAsync(server);
+        await using var _a = a;
+        await using var _b = b;
+        Assert.InRange(aStart.GetProperty("TurnTimeLeftMs").GetInt32(), 1, 300);
+
+        await a.SendAsync(Placement(aStart, requestId: 1));
+        Assert.True((await a.NextAsync("CommandResult")).GetProperty("Success").GetBoolean());
+
+        await b.NextEventAsync("TurnStartedEvent");
+        JsonElement units = b.LatestUpdate!.Value.GetProperty("Snapshot").GetProperty("Units");
+        Assert.Equal(8, units.GetArrayLength());
+        string aTeam = aStart.GetProperty("YourTeam").GetString()!;
+        Assert.Contains(units.EnumerateArray(), unit => unit.GetProperty("Team").GetString() == aTeam
+            && unit.GetProperty("CharacterId").GetString() == ChemistPiece.PieceId);
+    }
+
     // 아무것도 보내지 않는(반쯤 끊긴) 연결은 제한 시간 뒤 끊긴 것으로 보고, 상대가 이긴다.
     [Fact]
     public async Task SilentConnection_TimesOut_AndOpponentWins()
